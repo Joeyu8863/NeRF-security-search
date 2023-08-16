@@ -1,1 +1,1 @@
-# NeRF-Security-Search
+# NeRF-Security-Research
