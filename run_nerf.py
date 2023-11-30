@@ -513,6 +513,8 @@ def config_parser():
                         help='render the test set instead of render_poses path')
     parser.add_argument("--render_factor", type=int, default=0, 
                         help='downsampling factor to speed up rendering, set 4 or 8 for fast preview')
+    parser.add_argument("--rd", type=int, default=0, 
+                        help='generating the video and imageset from victim model')
     parser.add_argument("--quan", type=int, default=0, 
                         help='decide training with quantizated model or float model')
     # training options
@@ -1422,7 +1424,7 @@ def train():
         criterion = img2mse
         rounds = args.rounds
         avgs = 1
-        rd = 0
+        
     
         psnr_list = []
         layer=torch.Tensor(avgs,rounds+1).fill_(0) 
@@ -1508,7 +1510,7 @@ def train():
         #print('mssim:',mssm)
 
 
-        if rd == 1:
+        if args.rd == 1:
             with torch.no_grad():
                 if args.render_test:
                     # render_test switches to test poses
