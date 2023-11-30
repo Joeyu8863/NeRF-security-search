@@ -37,6 +37,9 @@ unzip nerf_synthetic.zip
 ```
 
 Quick Start
+I provide the trained model in origin.tar and quan.tar. If you don't want to train your own model, you can download that and place them in /data/nerf_synthetic/lego, then rename them to 200000.tar. After that you can directly go to last part. 
+
+
 Train orignal NeRF model
 
 ```
@@ -45,7 +48,7 @@ python3 run_nerf.py --config configs/lego.txt
 
 Before you train the quantized model, you need replace all nn.Linear to bilinear in NeRF class in run_nerf_helpers. Then excute the same command.
 After the previous steps complete, run the following part to convert the model to quantized form and excute BFA. rounds meanshow many bits you want to attack in total, rd mean do you want to generate the imageset and video or not.(1 means yes, 0 means no)
-
+All train process takes about 13-15 hours with NVIDIA A100 GPU Server.
 ```
 python3 run_nerf.py --config configs/lego.txt --convert=1 --rounds=10 --rd=1
 ```
