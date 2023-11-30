@@ -34,8 +34,11 @@ unzip nerf_synthetic.zip
 
 Quick Start
 Train orignal NeRF model
+```
 python3 run_nerf.py --config configs/lego.txt
-
+```
 Before you train the quantized model, you need replace all nn.Linear to bilinear in NeRF class in run_nerf_helpers. Then excute the same command.
 After the previous steps complete, run the following part to convert the model to quantized form and excute BFA. rounds meanshow many bits you want to attack in total, rd mean do you want to generate the imageset and video or not.(1 means yes, 0 means no)
+```
 python3 run_nerf.py --config configs/lego.txt --convert=1 --rounds=10
+```
