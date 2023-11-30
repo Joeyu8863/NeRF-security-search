@@ -7,6 +7,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import lpips
 from tqdm import tqdm, trange
 from attack import BFA1,validate,validate2,int2bin,bin2int,weight_conversion
 import matplotlib.pyplot as plt
@@ -17,10 +18,14 @@ from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_LINEMOD import load_LINEMOD_data
-import torch.quantization
+import torch.quantization as quantization
 from torch.quantization import QuantStub, DeQuantStub
 from torchmetrics.image import MultiScaleStructuralSimilarityIndexMeasure
-
+import pytorch_quantization
+from pytorch_quantization import nn as quant_nn
+from pytorch_quantization import quant_modules
+from pytorch_quantization.tensor_quant import QuantDescriptor
+from pytorch_quantization import calib
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 #device = torch.device("cpu")
@@ -194,9 +199,13 @@ def create_nerf(args):
     
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [4]
+    if args.quan == 1:
+        quant_modules.initialize()
+
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+    
     grad_vars = list(model.parameters())
 
     model_fine = None
@@ -235,6 +244,7 @@ def create_nerf(args):
         ckpt = torch.load(ckpt_path)
 
         start = ckpt['global_step']
+        print(start)
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
 
         # Load model
@@ -395,7 +405,7 @@ def render_rays(ray_batch,
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
 
-#     raw = run_network(pts)
+    #raw = run_network(pts)
     #print("pts ",pts.shape)
     #print("rays_d ",rays_d.shape)
     raw = network_query_fn(pts, viewdirs, network_fn)
@@ -442,7 +452,7 @@ def config_parser():
                         help='config file path')
     parser.add_argument("--expname", type=str, 
                         help='experiment name')
-    parser.add_argument("--basedir", type=str, default='./logs2/', 
+    parser.add_argument("--basedir", type=str, default='./logs/', 
                         help='where to store ckpts and logs')
     parser.add_argument("--datadir", type=str, default='./data/llff/fern', 
                         help='input data directory')
@@ -503,7 +513,8 @@ def config_parser():
                         help='render the test set instead of render_poses path')
     parser.add_argument("--render_factor", type=int, default=0, 
                         help='downsampling factor to speed up rendering, set 4 or 8 for fast preview')
-
+    parser.add_argument("--quan", type=int, default=0, 
+                        help='decide training with quantizated model or float model')
     # training options
     parser.add_argument("--precrop_iters", type=int, default=0,
                         help='number of steps to train on central crops')
@@ -513,7 +524,7 @@ def config_parser():
     # dataset options
     parser.add_argument("--dataset_type", type=str, default='llff', 
                         help='options: llff / blender / deepvoxels')
-    parser.add_argument("--testskip", type=int, default=8, 
+    parser.add_argument("--testskip", type=int, default=16, 
                         help='will load 1/N images from test/val sets, useful for large datasets like deepvoxels')
 
     ## deepvoxels flags
@@ -660,16 +671,50 @@ def train():
 
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
-    start = 199999
+    #start = 199999
     global_step = start
+    print(start)
+
+    '''
+    model = render_kwargs_train['network_fn'] 
+    fused_model = model
+    print(model)
+    model.train()
+    for name, module in model.named_modules():
+        print(type(module))
+    quantization_config = torch.quantization.get_default_qconfig("fbgemm")
+    model.train()
+    model = torch.ao.quantization.prepare_qat(model,inplace=True)
+    model = torch.ao.quantization.convert(model)
     
+    model = torch.ao.quantization.quantize_dynamic(model, {torch.nn.Linear},dtype=torch.qint8)
+    for name, module in model.named_modules():
+        print(type(module))
+    #print(fused_model)
+    render_kwargs_train['network_fn']  = model
+    '''
     bds_dict = {
         'near' : near,
         'far' : far,
     }
     render_kwargs_train.update(bds_dict)
     render_kwargs_test.update(bds_dict)
-
+    '''
+    if args.quan==1:
+        model = render_kwargs_train['network_fn']
+        model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
+        for name, module in model.named_modules():
+            print(type(module))
+        
+        model = torch.ao.quantization.prepare_qat(model,inplace=True).to('cpu')
+        model.eval()
+        model = torch.ao.quantization.convert(model)
+        
+        torch.save(model.state_dict(), "tmp.pt")
+        print("%.2f MB" %(os.path.getsize("tmp.pt")/1e6))
+        os.remove('tmp.pt')
+        render_kwargs_train['network_fn'] = model
+    '''
     # Move testing data to GPU
     render_poses = torch.Tensor(render_poses).to(device)
 
@@ -751,6 +796,12 @@ def train():
 
         else:
             # Random from one image
+            '''
+            psnr = 0.0
+            ssm = 0.0
+            loss = 0.0
+            for j in range(10):
+            '''
             img_i = np.random.choice(i_train)
             target = images[img_i]
             target = torch.Tensor(target).to(device)
@@ -781,18 +832,25 @@ def train():
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 #target_d = target[select_coords[:, 1], select_coords[:, 1]]  # (N_rand, 3)
         #####  Core optimization loop  #####
-        rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                verbose=i < 10, retraw=True,
-                                                **render_kwargs_train)
+        
+            rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+                                                    verbose=i < 10, retraw=True,
+                                                    **render_kwargs_train)
 
-        optimizer.zero_grad()
-        img_loss = img2mse(rgb, target_s)
-        #print("imgloss",img_loss.size())
-        trans = extras['raw'][...,-1]
-        loss = img_loss
-        psnr = mse2psnr(img_loss)
-        #print("psnr",psnr)
-        print('disp',disp)
+            optimizer.zero_grad()
+            img_loss = img2mse(rgb, target_s)
+            #print("imgloss",img_loss.size())
+            trans = extras['raw'][...,-1]
+            loss = img_loss
+            psnr_t = mse2psnr(img_loss)
+            psnr = psnr_t.item()
+            #print("psnr",psnr)
+            #print('disp',disp)
+            ssm_t = ssim(to8b(rgb.detach().cpu().numpy()),to8b(target_s.detach().cpu().numpy()),channel_axis=-1)
+            ssm = ssm_t.item()
+        #loss_fn = lpips.LPIPS(net="vgg").to(device)
+        #lps = loss_fn(rgb,target_s)
+
         if 'rgb0' in extras:
             img_loss0 = img2mse(extras['rgb0'], target_s)
             loss = loss + img_loss0
@@ -822,7 +880,7 @@ def train():
             
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
             torch.save({
-                'global_step': start-1,
+                'global_step': i,
                 'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
                 'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
@@ -855,7 +913,14 @@ def train():
 
     
         if i%args.i_print==0:
-            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+            #tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss/10.0}  PSNR: {psnr/10.0} SSIM: {ssm/10.0}")
+            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr} SSIM: {ssm}")
+            model = render_kwargs_train['network_fn']
+
+            #torch.save(model.state_dict(), "tmp.pt")
+            #print("%.2f MB" %(os.path.getsize("tmp.pt")/1e6))
+            #os.remove('tmp.pt')
+        
         """
             print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
             print('iter time {:.05f}'.format(dt))
@@ -898,327 +963,327 @@ def train():
                         tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
         """
     
-    if args.modify == True:
-        model = render_kwargs_train['network_fn']
-        t = model
-        #print(len(t["pts_linears.0.weight"]))
-        #print(t["pts_linears.0.weight.grad"])
-        clone_kwargs_train, _, start, grad_vars, optimizer = create_nerf(args)
-        model_clone = model
-        
-        
-        
-        model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
-        for name, module in model.named_modules():
-            print(type(module))
-        #model = torch.ao.quantization.quantize_dynamic(model.to('cpu'), {torch.nn.Linear},dtype=torch.qint8)
-        
-        model = torch.ao.quantization.prepare_qat(model,inplace=True).to('cpu')
-        model.eval()
-        model = torch.ao.quantization.convert(model)
-        for name, module in model.named_modules():
-            print(type(module))
-            if isinstance(module,torch.nn.quantized.modules.Linear):
-                print(module.weight.data)
-        '''
-        # define black box area in 3D
-        sampling_res = 128  # N_samples = 128^3
-        X = torch.arange(sampling_res, dtype=torch.int32, device=device)   # [128]
-        Y = torch.arange(sampling_res, dtype=torch.int32, device=device)   # [128]
-        Z = torch.arange(sampling_res, dtype=torch.int32, device=device)   # [128]
-        xx, yy, zz = torch.meshgrid(X, Y, Z, indexing='ij')
-        coords = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1) # [N_samples, 3], in [0, 128)
-        xyzs = 2 * coords.float() / (sampling_res - 1) - 1 # [N_samples, 3] in [-1, 1]
-        dirs = torch.zeros_like(xyzs)   # [N_samples, 3]
-        dirs[:,2] = -1        # raw = network_query_fn(pts, viewdirs, network_fn)
-        ### network_query_fn
-        embed_fn, input_ch = get_embedder_cpu(args.multires, args.i_embed)
-        embedded = embed_fn(xyzs)   # [N_samples, 63]        
-        embeddirs_fn, input_ch_views = get_embedder_cpu(args.multires_views, args.i_embed)
-        embedded_dirs = embeddirs_fn(dirs)  # [N_samples, 27]        
-        embedded = torch.cat([embedded, embedded_dirs], -1).cpu()   # [N_samples, 90]        fn = model
-        fn = model
-        
-        raw = batchify(fn, args.netchunk)(embedded) 
-        #print(raw)
-        ex = batchify(model_clone, args.netchunk)(embedded)
-        print(ex)
-        target = torch.zeros_like(ex)     # fake target of zeros for rgbd
-        ex.data = raw.data.double()
-        '''
-        
-        
-        #rays_o, rays_d = batch_rays[0,:,:], batch_rays[1,:,] # [N_rays, 3] each
-        #print(rays_d.shape)
-        #print(rays_o.shape)
-     
-        #viewdirs = batch_rays[:,-3:] if batch_rays.shape[-1] > 8 else None
-        
-        near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
-        viewdirs = rays_d
-        viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
-        viewdirs = torch.reshape(viewdirs, [-1,3]).float()
-        viewdirs[:,1] = -1
-
-        t_vals = torch.linspace(0., 1., steps=64)
-        if not args.lindisp:
-            z_vals = near * (1.-t_vals) + far * (t_vals)
-        else:
-            z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
-        #print(z_vals)
-        z_vals = z_vals[-1].expand([1024, 64])
-        pytest = False
-        if args.perturb > 0.:
-            # get intervals between samples
-            mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
-            upper = torch.cat([mids, z_vals[...,-1:]], -1)
-            lower = torch.cat([z_vals[...,:1], mids], -1)
-            # stratified samples in those intervals
-            t_rand = torch.rand(z_vals.shape)
-
-            # Pytest, overwrite u with numpy's fixed random numbers
-            if pytest:
-                np.random.seed(0)
-                t_rand = np.random.rand(*list(z_vals.shape))
-                t_rand = torch.Tensor(t_rand)
-
-            z_vals = lower + (upper - lower) * t_rand
-        #print(rays_o.shape)
-        ori = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None]
-        rays_o[:10,:] = 1
-        pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None]
-        
-        
-        
-        #model.eval()
-        
-        
-        
-        model.eval()
-        embed_fn, input_ch = get_embedder_cpu(args.multires, args.i_embed)
-        embeddirs_fn, input_ch_views = get_embedder_cpu(args.multires_views, args.i_embed)
-        network_q_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn.to('cpu'),
-                                                                embed_fn=embed_fn,
-                                                                embeddirs_fn=embeddirs_fn,
-                                                                netchunk=args.netchunk)
-        
-        #network_q_fn = render_kwargs_train['network_query_fn']
-        #print(xyzs.shape)
-        #print(viewdirs.shape)
-        print(model)
-        raw = network_q_fn(ori.to('cpu'), rays_d.to('cpu'), model.to('cpu'))
-        print('done fitting')
-        criterion = img2mse
-        rounds = 1
-        avgs = 5
-        acc=torch.Tensor(avgs,rounds+1).fill_(0) ## accuracy track
-        acc1=torch.Tensor(avgs,rounds+1).fill_(0) ## accuracy without attacked class and without test samples used for attack
-        temp=torch.Tensor(avgs,rounds+1).fill_(0) ##ASR on attack samples
-        temp1=torch.Tensor(avgs,rounds+1).fill_(0) ## ASR on rest of the  sample
-        layer=torch.Tensor(avgs,rounds+1).fill_(0) 
-        offsets=torch.Tensor(avgs,rounds+1).fill_(0)
-        bfas=torch.Tensor(avgs).fill_(0) ## recording number of bitflips
-        attacker1 = BFA1(criterion,10)
-        r=0
-        for j in range(avgs):
+        if args.modify == True:
+            model = render_kwargs_train['network_fn']
+            t = model
+            #print(len(t["pts_linears.0.weight"]))
+            #print(t["pts_linears.0.weight.grad"])
+            clone_kwargs_train, _, start, grad_vars, optimizer = create_nerf(args)
+            model_clone = model
+            
+            
+            
+            model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
+            for name, module in model.named_modules():
+                print(type(module))
+            #model = torch.ao.quantization.quantize_dynamic(model.to('cpu'), {torch.nn.Linear},dtype=torch.qint8)
+            
+            model = torch.ao.quantization.prepare_qat(model,inplace=True).to('cpu')
             model.eval()
-            data_p = ori
-            data_d = rays_d
-            target = raw
-            data1 = torch.zeros_like(data_p)
-            target1 = torch.zeros_like(target)
-            print("modify")
-            #_,acc[j,0]=validate(model, network_q_fn,device, criterion, data_p,data_d,target, 0)
-            #_,temp[j,0]=validate2(model,network_q_fn, device, criterion, data_p,data_d,target, 0)
-            for r in range(rounds):
-                #layer[j,r+1],offsets[j,r+1]=attacker1.progressive_bit_search(model,model_clone,network_q_fn, data_p,data_d, target,data1,target1.long())
-                print(r+1)
-                #_,acc[j,r+1]=validate(model, network_q_fn,device, criterion, data_p,data_d,target, 0)
-                #_,temp[j,r+1]=validate2(model, network_q_fn,device, criterion, data_p,data_d,target, 0)
+            model = torch.ao.quantization.convert(model)
             
+            torch.save(model.state_dict(), "tmp.pt")
+            print("%.2f MB" %(os.path.getsize("tmp.pt")/1e6))
+            os.remove('tmp.pt')
+            '''
+            # define black box area in 3D
+            sampling_res = 128  # N_samples = 128^3
+            X = torch.arange(sampling_res, dtype=torch.int32, device=device)   # [128]
+            Y = torch.arange(sampling_res, dtype=torch.int32, device=device)   # [128]
+            Z = torch.arange(sampling_res, dtype=torch.int32, device=device)   # [128]
+            xx, yy, zz = torch.meshgrid(X, Y, Z, indexing='ij')
+            coords = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1) # [N_samples, 3], in [0, 128)
+            xyzs = 2 * coords.float() / (sampling_res - 1) - 1 # [N_samples, 3] in [-1, 1]
+            dirs = torch.zeros_like(xyzs)   # [N_samples, 3]
+            dirs[:,2] = -1        # raw = network_query_fn(pts, viewdirs, network_fn)
+            ### network_query_fn
+            embed_fn, input_ch = get_embedder_cpu(args.multires, args.i_embed)
+            embedded = embed_fn(xyzs)   # [N_samples, 63]        
+            embeddirs_fn, input_ch_views = get_embedder_cpu(args.multires_views, args.i_embed)
+            embedded_dirs = embeddirs_fn(dirs)  # [N_samples, 27]        
+            embedded = torch.cat([embedded, embedded_dirs], -1).cpu()   # [N_samples, 90]        fn = model
+            fn = model
+            
+            raw = batchify(fn, args.netchunk)(embedded) 
+            #print(raw)
+            ex = batchify(model_clone, args.netchunk)(embedded)
+            print(ex)
+            target = torch.zeros_like(ex)     # fake target of zeros for rgbd
+            ex.data = raw.data.double()
+            '''
+            
+            
+            #rays_o, rays_d = batch_rays[0,:,:], batch_rays[1,:,] # [N_rays, 3] each
+            #print(rays_d.shape)
+            #print(rays_o.shape)
+        
+            #viewdirs = batch_rays[:,-3:] if batch_rays.shape[-1] > 8 else None
+            
+            near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
+            viewdirs = rays_d
+            viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
+            viewdirs = torch.reshape(viewdirs, [-1,3]).float()
+            viewdirs[:,1] = -1
+
+            t_vals = torch.linspace(0., 1., steps=64)
+            if not args.lindisp:
+                z_vals = near * (1.-t_vals) + far * (t_vals)
+            else:
+                z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
+            #print(z_vals)
+            z_vals = z_vals[-1].expand([1024, 64])
+            pytest = False
+            if args.perturb > 0.:
+                # get intervals between samples
+                mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+                upper = torch.cat([mids, z_vals[...,-1:]], -1)
+                lower = torch.cat([z_vals[...,:1], mids], -1)
+                # stratified samples in those intervals
+                t_rand = torch.rand(z_vals.shape)
+
+                # Pytest, overwrite u with numpy's fixed random numbers
+                if pytest:
+                    np.random.seed(0)
+                    t_rand = np.random.rand(*list(z_vals.shape))
+                    t_rand = torch.Tensor(t_rand)
+
+                z_vals = lower + (upper - lower) * t_rand
+            #print(rays_o.shape)
+            ori = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None]
+            rays_o[:10,:] = 1
+            
+            
+            
+            
+            #model.eval()
+            
+            
+            
+            model.eval()
+            embed_fn, input_ch = get_embedder_cpu(args.multires, args.i_embed)
+            embeddirs_fn, input_ch_views = get_embedder_cpu(args.multires_views, args.i_embed)
+            network_q_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn.to('cpu'),
+                                                                    embed_fn=embed_fn,
+                                                                    embeddirs_fn=embeddirs_fn,
+                                                                    netchunk=args.netchunk)
+            
+            #network_q_fn = render_kwargs_train['network_query_fn']
+            #print(xyzs.shape)
+            #print(viewdirs.shape)
+            print(model)
+            raw = network_q_fn(ori.to('cpu'), rays_d.to('cpu'), model.to('cpu'))
+            print('done fitting')
+            criterion = img2mse
+            rounds = 1
+            avgs = 5
+            layer=torch.Tensor(avgs,rounds+1).fill_(0) 
+            offsets=torch.Tensor(avgs,rounds+1).fill_(0)
+            bfas=torch.Tensor(avgs).fill_(0) ## recording number of bitflips
+            attacker1 = BFA1(criterion,10)
+            r=0
+            for j in range(avgs):
+                model.eval()
+                data_p = ori
+                data_d = rays_d
+                target = raw
+                data1 = torch.zeros_like(data_p)
+                target1 = torch.zeros_like(target)
+                print("modify")
+                #_,acc[j,0]=validate(model, network_q_fn,device, criterion, data_p,data_d,target, 0)
+                #_,temp[j,0]=validate2(model,network_q_fn, device, criterion, data_p,data_d,target, 0)
+                for r in range(rounds):
+                    #layer[j,r+1],offsets[j,r+1]=attacker1.progressive_bit_search(model,model_clone,network_q_fn, data_p,data_d, target,data1,target1.long())
+                    print(r+1)
+                    #_,acc[j,r+1]=validate(model, network_q_fn,device, criterion, data_p,data_d,target, 0)
+                    #_,temp[j,r+1]=validate2(model, network_q_fn,device, criterion, data_p,data_d,target, 0)
                 
-            bfas[j]=int(r+1) 
-        test_acc=torch.Tensor(avgs).fill_(0) ## recording test accuracy   
-        ASR_as=torch.Tensor(avgs).fill_(0) ## recording ASR
-        ASR_val=torch.Tensor(avgs).fill_(0) ## recording validation ASR
-        rem_acc=torch.Tensor(avgs).fill_(0) ## recording accuracy on ramaining data   
-        print("layer",layer)
-        print(offsets)
+                    
+                bfas[j]=int(r+1) 
+            test_acc=torch.Tensor(avgs).fill_(0) ## recording test accuracy   
+            ASR_as=torch.Tensor(avgs).fill_(0) ## recording ASR
+            ASR_val=torch.Tensor(avgs).fill_(0) ## recording validation ASR
+            rem_acc=torch.Tensor(avgs).fill_(0) ## recording accuracy on ramaining data   
+            print("layer",layer)
+            print(offsets)
 
-        
-        raw = network_q_fn(ori.to('cpu'), rays_d.to('cpu'), model.to('cpu'))
-        print('done fitting')
-        target = network_q_fn(ori.to('cpu'), rays_d.to('cpu'), model.to('cpu'))
-        ex = network_q_fn(ori.to('cpu'), rays_d.to('cpu'), t.to('cpu'))
-        
-        #model.train()
-        
-        #fake_gt = torch.zeros_like(raw)
-        #print(raw)
-        #ex2 = ex.clone()
-        #ex.data=raw.data.double()
-        #test = model.state_dict()
-        #print(test["pts_linears.0._packed_params._packed_params"][0])
-        '''
-        weights = model.state_dict()
-        
-        module_list = list(model_clone.modules())
-        module_list[3].weight.data.copy_(torch.dequantize(weights["pts_linears.0._packed_params._packed_params"][0]))
-        module_list[4].weight.data.copy_(torch.dequantize(weights["pts_linears.1._packed_params._packed_params"][0]))
-        module_list[5].weight.data.copy_(torch.dequantize(weights["pts_linears.2._packed_params._packed_params"][0]))
-        module_list[6].weight.data.copy_(torch.dequantize(weights["pts_linears.3._packed_params._packed_params"][0]))
-        module_list[7].weight.data.copy_(torch.dequantize(weights["pts_linears.4._packed_params._packed_params"][0]))
-        module_list[8].weight.data.copy_(torch.dequantize(weights["pts_linears.5._packed_params._packed_params"][0]))
-        module_list[9].weight.data.copy_(torch.dequantize(weights["pts_linears.6._packed_params._packed_params"][0]))
-        module_list[10].weight.data.copy_(torch.dequantize(weights["pts_linears.7._packed_params._packed_params"][0]))
-        module_list[12].weight.data.copy_(torch.dequantize(weights["views_linears.0._packed_params._packed_params"][0]))
-        module_list[13].weight.data.copy_(torch.dequantize(weights["feature_linear._packed_params._packed_params"][0]))
-        module_list[14].weight.data.copy_(torch.dequantize(weights["alpha_linear._packed_params._packed_params"][0]))
-        module_list[15].weight.data.copy_(torch.dequantize(weights["rgb_linear._packed_params._packed_params"][0]))        
-        module_list[3].bias.data.copy_(torch.dequantize(weights["pts_linears.0._packed_params._packed_params"][1]))
-        module_list[4].bias.data.copy_(torch.dequantize(weights["pts_linears.1._packed_params._packed_params"][1]))
-        module_list[5].bias.data.copy_(torch.dequantize(weights["pts_linears.2._packed_params._packed_params"][1]))
-        module_list[6].bias.data.copy_(torch.dequantize(weights["pts_linears.3._packed_params._packed_params"][1]))
-        module_list[7].bias.data.copy_(torch.dequantize(weights["pts_linears.4._packed_params._packed_params"][1]))
-        module_list[8].bias.data.copy_(torch.dequantize(weights["pts_linears.5._packed_params._packed_params"][1]))
-        module_list[9].bias.data.copy_(torch.dequantize(weights["pts_linears.6._packed_params._packed_params"][1]))
-        module_list[10].bias.data.copy_(torch.dequantize(weights["pts_linears.7._packed_params._packed_params"][1]))
-        module_list[12].bias.data.copy_(torch.dequantize(weights["views_linears.0._packed_params._packed_params"][1]))
-        module_list[13].bias.data.copy_(torch.dequantize(weights["feature_linear._packed_params._packed_params"][1]))
-        module_list[14].bias.data.copy_(torch.dequantize(weights["alpha_linear._packed_params._packed_params"][1]))
-        module_list[15].bias.data.copy_(torch.dequantize(weights["rgb_linear._packed_params._packed_params"][1]))
-        model_clone.eval()
-        
-        for m in model_clone.modules():
-            if isinstance(m, nn.Linear):
-            #if isinstance(m, nn.quantized.dynamic.modules.Linear):
-                if m.weight.grad is not None:
-                    m.weight.grad.data.zero_()
-    
-        '''
-        # gradient update
-        #optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
-        #optimizer.zero_grad()
-        #print(raw)
-        
-        img_loss = img2mse(ex, target)
-        print('lmg_loss',img_loss)
-        
-        loss = torch.tensor(img_loss, requires_grad = True)
-        loss = img_loss
-        
-        psnr = mse2psnr(loss)
-        print("new psnr",psnr)
-        print("loss:",type(img_loss))
-        print('disp',(disp))
-        print(disp.shape)
-        #d = img2mse(ndisp,disp)
-        #print('disp',mse2psnr(d))
-        #a = img2mse(nacc, acc)
-        #print("alpha",mse2psnr(a))
-        
-        loss.backward()
-    ''' 
-        #scaler = torch.cuda.amp.GradScaler(init_scale=64)
-        #scaler.scale(loss.to(device)).backward()
-        #optimizer.step()
-        
-        
-        wb = 20
-        maxgrad = []
-        maxgradid = []
-        layers = []
-        weights =[]
-        #path = os.path.join(basedir, expname, '200000.tar')
-        #l = torch.load(path)
-        #model=l['network_fn_state_dict']
-        
-        
-        for name, module in model_clone.named_modules():
-            print(name)
-            print(module)
             
-            for i,layer in module.named_modules():
-                print(type(layer))
-                if isinstance(layer, nn.Linear):
-                #if isinstance(layer, nn.quantized.dynamic.modules.Linear):
-                    
-                    #print(type(layer.weight))
-                    grad_shape = layer.weight.grad.shape
-                    w_v, w_id = layer.weight.grad.detach().abs().view(-1).topk(wb) ## taking only 200 weights thus wb=200
-                    ii = w_id//grad_shape[1]
-                    jj = w_id%grad_shape[1]
-                    w_id = torch.cat([ii.view(-1,1), jj.view(-1,1)], dim=-1)
-                    layers.append(name)
-                    maxgrad.append(layer.weight.grad[ii, jj])
-                    weights.append(layer.weight[ii, jj])
-                    print(layer.weight.grad[ii, jj])
-                    maxgradid.append(w_id)
-                    
-                print(f"===> len of maxgradid, maxgrad: {len(maxgradid)}, {len(maxgrad)}")
-        model_fp32 = render_kwargs_train['network_fn'].state_dict()
-        
-        st = 20
-        ik=8
-        '''
-    '''
-        for name, idxs, grads in zip(layers[st+ik:st+1+ik], maxgradid[st+ik:st+1+ik], maxgrad[st+ik:st+1+ik]):
-            print(f'=======================>  gradient attack test  <========================')
-            print(f'    {name}, {idxs}, {grads}')
-            #global_step += 1
-        
-            if not name == "views_linears":
-                for idx, grad in zip(idxs, grads):
-                            old_val = model_fp32[f'{name}.weight'][idx[0], idx[1]].item()
-                            new_val = old_val - 0.01*grad
-                            #new_val = modeld[f'{name}.weight'][idx[0], idx[1]].item()
-                            model_fp32[f'{name}.weight'][idx[0], idx[1]] = new_val
-                            print(f'    @[{idx[0]}, {idx[1]}]: {old_val} -> {new_val}')
-        '''
-    '''
-        pts_layer = layers[20:28]
-        pts_gradid = maxgradid[20:28]
-        pts_grad = []
-        pts_grad.append(maxgrad[20].detach().cpu().numpy())
-        atk_gradlist = maxgrad[20].view(-1)
-        for i in range(1,8):
-            atk_gradlist = torch.cat((atk_gradlist.view(-1),maxgrad[20+i].view(-1)),dim=-1)
-            pts_grad.append(maxgrad[20+i].detach().cpu().numpy())
-        w_v, w_id = atk_gradlist.detach().abs().view(-1).topk(wb)
-        #print(atk_gradlist)
-        ows = model_clone.state_dict()
-        for i in range(wb):
+            #raw = network_q_fn(ori.to('cpu'), rays_d.to('cpu'), model.to('cpu'))
+            #print('done fitting')
+            #target = network_q_fn(ori.to('cpu'), rays_d.to('cpu'), model.to('cpu'))
+            #ex = network_q_fn(ori.to('cpu'), rays_d.to('cpu'), t.to('cpu'))
             
-            for j in range(8): 
+            #model.train()
+            
+            #fake_gt = torch.zeros_like(raw)
+            #print(raw)
+            #ex2 = ex.clone()
+            #ex.data=raw.data.double()
+            #test = model.state_dict()
+            #print(test["pts_linears.0._packed_params._packed_params"][0])
+            '''
+            weights = model.state_dict()
+            
+            module_list = list(model_clone.modules())
+            module_list[3].weight.data.copy_(torch.dequantize(weights["pts_linears.0._packed_params._packed_params"][0]))
+            module_list[4].weight.data.copy_(torch.dequantize(weights["pts_linears.1._packed_params._packed_params"][0]))
+            module_list[5].weight.data.copy_(torch.dequantize(weights["pts_linears.2._packed_params._packed_params"][0]))
+            module_list[6].weight.data.copy_(torch.dequantize(weights["pts_linears.3._packed_params._packed_params"][0]))
+            module_list[7].weight.data.copy_(torch.dequantize(weights["pts_linears.4._packed_params._packed_params"][0]))
+            module_list[8].weight.data.copy_(torch.dequantize(weights["pts_linears.5._packed_params._packed_params"][0]))
+            module_list[9].weight.data.copy_(torch.dequantize(weights["pts_linears.6._packed_params._packed_params"][0]))
+            module_list[10].weight.data.copy_(torch.dequantize(weights["pts_linears.7._packed_params._packed_params"][0]))
+            module_list[12].weight.data.copy_(torch.dequantize(weights["views_linears.0._packed_params._packed_params"][0]))
+            module_list[13].weight.data.copy_(torch.dequantize(weights["feature_linear._packed_params._packed_params"][0]))
+            module_list[14].weight.data.copy_(torch.dequantize(weights["alpha_linear._packed_params._packed_params"][0]))
+            module_list[15].weight.data.copy_(torch.dequantize(weights["rgb_linear._packed_params._packed_params"][0]))        
+            module_list[3].bias.data.copy_(torch.dequantize(weights["pts_linears.0._packed_params._packed_params"][1]))
+            module_list[4].bias.data.copy_(torch.dequantize(weights["pts_linears.1._packed_params._packed_params"][1]))
+            module_list[5].bias.data.copy_(torch.dequantize(weights["pts_linears.2._packed_params._packed_params"][1]))
+            module_list[6].bias.data.copy_(torch.dequantize(weights["pts_linears.3._packed_params._packed_params"][1]))
+            module_list[7].bias.data.copy_(torch.dequantize(weights["pts_linears.4._packed_params._packed_params"][1]))
+            module_list[8].bias.data.copy_(torch.dequantize(weights["pts_linears.5._packed_params._packed_params"][1]))
+            module_list[9].bias.data.copy_(torch.dequantize(weights["pts_linears.6._packed_params._packed_params"][1]))
+            module_list[10].bias.data.copy_(torch.dequantize(weights["pts_linears.7._packed_params._packed_params"][1]))
+            module_list[12].bias.data.copy_(torch.dequantize(weights["views_linears.0._packed_params._packed_params"][1]))
+            module_list[13].bias.data.copy_(torch.dequantize(weights["feature_linear._packed_params._packed_params"][1]))
+            module_list[14].bias.data.copy_(torch.dequantize(weights["alpha_linear._packed_params._packed_params"][1]))
+            module_list[15].bias.data.copy_(torch.dequantize(weights["rgb_linear._packed_params._packed_params"][1]))
+            model_clone.eval()
+            
+            for m in model_clone.modules():
+                if isinstance(m, nn.Linear):
+                #if isinstance(m, nn.quantized.dynamic.modules.Linear):
+                    if m.weight.grad is not None:
+                        m.weight.grad.data.zero_()
+        
+            '''
+
+            '''
+            img_loss = img2mse(ex, target)
+            print('lmg_loss',img_loss)
+            
+            loss = torch.tensor(img_loss, requires_grad = True)
+            loss = img_loss
+            '''
+            render_kwargs_train['network_fn'] = model
+            rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+                                                    verbose=i < 10, retraw=True,
+                                                    **render_kwargs_train)
+
+            optimizer.zero_grad()
+            img_loss = img2mse(rgb, target_s)
+            psnr = mse2psnr(loss)
+            print("new psnr",psnr)
+            print("loss:",type(img_loss))
+            print('disp',(disp))
+            print(disp.shape)
+            #d = img2mse(ndisp,disp)
+            #print('disp',mse2psnr(d))
+            #a = img2mse(nacc, acc)
+            #print("alpha",mse2psnr(a))
+            
+            loss.backward()
+        ''' 
+            #scaler = torch.cuda.amp.GradScaler(init_scale=64)
+            #scaler.scale(loss.to(device)).backward()
+            #optimizer.step()
+            
+            
+            wb = 20
+            maxgrad = []
+            maxgradid = []
+            layers = []
+            weights =[]
+            #path = os.path.join(basedir, expname, '200000.tar')
+            #l = torch.load(path)
+            #model=l['network_fn_state_dict']
+            
+            
+            for name, module in model_clone.named_modules():
+                print(name)
+                print(module)
                 
-                if w_v[i].data.item() in pts_grad[j]:
-                    n = np.where(pts_grad[j]==w_v[i].data.item())
-                    m=j
-            name = pts_layer[m]
-            idx = pts_gradid[m][n][0]
-            print(f'=======================>  gradient attack test  <========================')
-            print(f'    {name}, {idx}, {atk_gradlist[i]}')
+                for i,layer in module.named_modules():
+                    print(type(layer))
+                    if isinstance(layer, nn.Linear):
+                    #if isinstance(layer, nn.quantized.dynamic.modules.Linear):
+                        
+                        #print(type(layer.weight))
+                        grad_shape = layer.weight.grad.shape
+                        w_v, w_id = layer.weight.grad.detach().abs().view(-1).topk(wb) ## taking only 200 weights thus wb=200
+                        ii = w_id//grad_shape[1]
+                        jj = w_id%grad_shape[1]
+                        w_id = torch.cat([ii.view(-1,1), jj.view(-1,1)], dim=-1)
+                        layers.append(name)
+                        maxgrad.append(layer.weight.grad[ii, jj])
+                        weights.append(layer.weight[ii, jj])
+                        print(layer.weight.grad[ii, jj])
+                        maxgradid.append(w_id)
+                        
+                    print(f"===> len of maxgradid, maxgrad: {len(maxgradid)}, {len(maxgrad)}")
+            model_fp32 = render_kwargs_train['network_fn'].state_dict()
             
-            old_val = model_fp32[f'{name}.weight'][idx[0], idx[1]].item()
-            new_val = old_val - 0.01*w_v[i].data.item()
-            ow = ows[f'{name}.weight'][idx[0], idx[1]].item()
-            #new_val = modeld[f'{name}.weight'][idx[0], idx[1]].item()
-            model_fp32[f'{name}.weight'][idx[0], idx[1]] = new_val
-            print(f'    @[{idx[0]}, {idx[1]}]: {old_val} -> {new_val},{ow}')
+            st = 20
+            ik=8
+            '''
+        '''
+            for name, idxs, grads in zip(layers[st+ik:st+1+ik], maxgradid[st+ik:st+1+ik], maxgrad[st+ik:st+1+ik]):
+                print(f'=======================>  gradient attack test  <========================')
+                print(f'    {name}, {idxs}, {grads}')
+                #global_step += 1
+            
+                if not name == "views_linears":
+                    for idx, grad in zip(idxs, grads):
+                                old_val = model_fp32[f'{name}.weight'][idx[0], idx[1]].item()
+                                new_val = old_val - 0.01*grad
+                                #new_val = modeld[f'{name}.weight'][idx[0], idx[1]].item()
+                                model_fp32[f'{name}.weight'][idx[0], idx[1]] = new_val
+                                print(f'    @[{idx[0]}, {idx[1]}]: {old_val} -> {new_val}')
+            '''
+        '''
+            pts_layer = layers[20:28]
+            pts_gradid = maxgradid[20:28]
+            pts_grad = []
+            pts_grad.append(maxgrad[20].detach().cpu().numpy())
+            atk_gradlist = maxgrad[20].view(-1)
+            for i in range(1,8):
+                atk_gradlist = torch.cat((atk_gradlist.view(-1),maxgrad[20+i].view(-1)),dim=-1)
+                pts_grad.append(maxgrad[20+i].detach().cpu().numpy())
+            w_v, w_id = atk_gradlist.detach().abs().view(-1).topk(wb)
+            #print(atk_gradlist)
+            ows = model_clone.state_dict()
+            for i in range(wb):
+                
+                for j in range(8): 
+                    
+                    if w_v[i].data.item() in pts_grad[j]:
+                        n = np.where(pts_grad[j]==w_v[i].data.item())
+                        m=j
+                name = pts_layer[m]
+                idx = pts_gradid[m][n][0]
+                print(f'=======================>  gradient attack test  <========================')
+                print(f'    {name}, {idx}, {atk_gradlist[i]}')
+                
+                old_val = model_fp32[f'{name}.weight'][idx[0], idx[1]].item()
+                new_val = old_val - 0.01*w_v[i].data.item()
+                ow = ows[f'{name}.weight'][idx[0], idx[1]].item()
+                #new_val = modeld[f'{name}.weight'][idx[0], idx[1]].item()
+                model_fp32[f'{name}.weight'][idx[0], idx[1]] = new_val
+                print(f'    @[{idx[0]}, {idx[1]}]: {old_val} -> {new_val},{ow}')
 
-        #ind = maxgradid[-1][0]
-        #print(ind)
-        path = os.path.join(basedir, expname, '200001.tar')
-        #print(model_fp32)
+            #ind = maxgradid[-1][0]
+            #print(ind)
+            path = os.path.join(basedir, expname, '200001.tar')
+            #print(model_fp32)
 
-        torch.save({
-            'global_step': 199999,
-            'network_fn_state_dict': model.state_dict(),
-            'network_fine_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-        }, path)
-        print('Saved checkpoints at', path)
-    '''
+            torch.save({
+                'global_step': 199999,
+                'network_fn_state_dict': model.state_dict(),
+                'network_fine_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }, path)
+            print('Saved checkpoints at', path)
+        '''
     if args.convert == True:
         
         embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
@@ -1226,12 +1291,14 @@ def train():
         input_ch_views = 0
         embeddirs_fn = None
         if args.use_viewdirs:
-           embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
+            embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
         output_ch = 5 if args.N_importance > 0 else 4
-        skips = [4]
-        imodel = quan_NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
-                          input_ch=input_ch, output_ch=output_ch, skips=skips,
-                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+        
+        
+        
+        imodel = quan_NeRF(D=args.netdepth, W=args.netwidth_fine,
+                        input_ch=input_ch, output_ch=output_ch, skips=[4],
+                        input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
         model_dict = imodel.state_dict()
         model = render_kwargs_train['network_fine']
         for n,m in model.named_modules():
@@ -1243,7 +1310,7 @@ def train():
         pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
         # 2. overwrite entries in the existing state dict	
         #print(pretrained_dict)
-       
+    
         model_dict.update(pretrained_dict) 	
         # 3. load the new state dict	
         imodel.load_state_dict(model_dict)
@@ -1258,6 +1325,64 @@ def train():
         for n,m in imodel.named_modules():
             print(m)
             print(type(m))
+            
+
+
+        
+        #torch.save(imodel.state_dict(), "tmp.pt")
+        #print("%.2f MB" %(os.path.getsize("tmp.pt")/1e6))
+        #os.remove('tmp.pt')
+
+        img_i = np.random.choice(i_train)
+        target = images[img_i]
+        target = torch.Tensor(target).to(device)
+        pose = poses[img_i, :3,:4].to(device)
+        rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose).to(device))  # (H, W, 3), (H, W, 3)
+        i=200000
+        if i < args.precrop_iters:
+            dH = int(H//2 * args.precrop_frac)
+            dW = int(W//2 * args.precrop_frac)
+            coords = torch.stack(
+                torch.meshgrid(
+                    torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH), 
+                    torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
+                ), -1)
+            if i == start:
+                print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")                
+        else:
+            coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
+
+        coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
+        select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
+        select_coords = coords[select_inds].long()  # (N_rand, 2)
+        rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+        rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+        batch_rays = torch.stack([rays_o, rays_d], 0)
+        target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+        #imageio.imwrite("target.png", to8b(target.detach().cpu().numpy()))
+        print("imodel",imodel)
+        '''
+        render_kwargs_train['network_fn'] = imodel
+        render_kwargs_train['network_fine'] = imodel
+        nrgb, ndisp, nacc, nextras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+                                                verbose=i < 10, retraw=True,
+                                                **render_kwargs_train)
+        
+        optimizer.zero_grad()
+        img_loss = img2mse(nrgb,target_s)
+        
+        loss = img_loss
+        #print(to8b(nrgb).dtype)
+        #print(nrgb.shape)
+        psnr = mse2psnr(img_loss)
+        ssm = ssim(to8b(nrgb.detach().cpu().numpy()),to8b(target_s.detach().cpu().numpy()),channel_axis=-1)
+        #mssim = MultiScaleStructuralSimilarityIndexMeasure(data_range=1.0)
+        #mssm = mssim(to8b(nrgb.detach().cpu().numpy()),to8b(rgb.detach().cpu().numpy()))
+
+        print("psnr:",psnr)
+        print('ssim:',ssm)
+        #print('mssim:',mssm)
+        '''
         
         
         
@@ -1297,13 +1422,14 @@ def train():
         criterion = img2mse
         rounds = args.rounds
         avgs = 1
-        rd = 1
+        rd = 0
+    
         psnr_list = []
         layer=torch.Tensor(avgs,rounds+1).fill_(0) 
         offsets=torch.Tensor(avgs,rounds+1).fill_(0)
         bfas=torch.Tensor(avgs).fill_(0) ## recording number of bitflips
         attacker1 = BFA1(criterion,10)
-        r=0
+        r=1
         embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
         network_q_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
@@ -1334,22 +1460,7 @@ def train():
                 #_,acc[j,r+1]=validate(model, network_q_fn,device, criterion, data_p,data_d,target, 0)
                 #_,temp[j,r+1]=validate2(model, network_q_fn,device, criterion, data_p,data_d,target, 0)
                 
-                '''
-                render_kwargs_train['network_fn'] = imodel
-                render_kwargs_train['network_fine'] = imodel
-                rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                        verbose=i < 10, retraw=True,
-                                                        **render_kwargs_train)
-                optimizer.zero_grad()
-                img_loss = img2mse(rgb, target_s)
-                
-                loss = img_loss
-                psnr = mse2psnr(img_loss)
-                psnr_list.append(psnr)
-                if psnr >= 10:
-                    rounds += 1
-                r += 1 
-                '''
+            
                 
             bfas[j]=int(r+1) 
             
@@ -1373,6 +1484,30 @@ def train():
                             print(zz[zz!=0].size())
         render_kwargs_test['network_fn'] = imodel
         render_kwargs_test['network_fine'] = imodel
+        render_kwargs_train['network_fn'] = imodel
+        render_kwargs_train['network_fine'] = imodel
+        nrgb, ndisp, nacc, nextras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+                                                verbose=i < 10, retraw=True,
+                                                **render_kwargs_train)
+        
+        optimizer.zero_grad()
+        img_loss = img2mse(nrgb,target_s)
+        
+        
+        
+        loss = img_loss
+        #print(to8b(nrgb).dtype)
+        #print(nrgb.shape)
+        psnr = mse2psnr(img_loss)
+        ssm = ssim(to8b(nrgb.detach().cpu().numpy()),to8b(target_s.detach().cpu().numpy()),channel_axis=-1)
+        #mssim = MultiScaleStructuralSimilarityIndexMeasure(data_range=1.0)
+        #mssm = mssim(to8b(nrgb.detach().cpu().numpy()),to8b(rgb.detach().cpu().numpy()))
+
+        print("psnr:",psnr)
+        print('ssim:',ssm)
+        #print('mssim:',mssm)
+
+
         if rd == 1:
             with torch.no_grad():
                 if args.render_test:
@@ -1384,52 +1519,30 @@ def train():
                     images = None
 
                 #testsavedir = os.path.join(basedir, expname, 'renderonly_{}_{:06d}'.format('test' if args.render_test else 'path', start))
-                testsavedir = os.path.join(basedir, expname, 'bfa_{:06d}'.format(args.rounds))
-                os.makedirs(testsavedir, exist_ok=True)
+                #testsavedir = os.path.join(basedir, expname, 'bfa_{:06d}'.format(args.rounds))
+                #os.makedirs(testsavedir, exist_ok=True)
+                
+                #images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
+                testsavedir = os.path.join(basedir, expname, 'bfa_testset_{:06d}'.format(args.rounds))
+                #os.makedirs(testsavedir, exist_ok=True)
+                #print('test poses shape', poses[i_test].shape)
+                #with torch.no_grad():
+                #    render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+                #print('Saved test set')
                 print('test poses shape', render_poses.shape)
-
                 rgbs, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
                 print('Done rendering', testsavedir)
                 imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
         
-        rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                verbose=i < 10, retraw=True,
-                                                **render_kwargs_train)
-        render_kwargs_train['network_fn'] = imodel
-        render_kwargs_train['network_fine'] = imodel
-        nrgb, ndisp, nacc, nextras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                verbose=i < 10, retraw=True,
-                                                **render_kwargs_train)
         
-        optimizer.zero_grad()
-        img_loss = img2mse(nrgb,target_s)
-        print('ndisp',(ndisp))
-        print('disp',(disp))
-        print(disp.shape)
-        d = img2mse(ndisp,disp)
-        print('disp',mse2psnr(d))
-        a = img2mse(nacc, acc)
-        print("alpha",mse2psnr(a))
-        trans = extras['raw'][...,-1]
         
-        loss = img_loss
-        #print(to8b(nrgb).dtype)
-        #print(nrgb.shape)
-        psnr = mse2psnr(img_loss)
-        ssm = ssim(to8b(nrgb.detach().cpu().numpy()),to8b(rgb.detach().cpu().numpy()),channel_axis=-1)
-        mssim = MultiScaleStructuralSimilarityIndexMeasure(data_range=1.0)
-        mssm = mssim(to8b(nrgb.detach().cpu().numpy()),to8b(rgb.detach().cpu().numpy()))
-
-        print("psnr:",psnr)
-        print('ssim:',ssm)
-        print('mssim:',mssm)
-       
+    
         
 
-        '''
-        path = os.path.join(basedir, expname, '200001.tar')
+        
+        #path = os.path.join(basedir, expname, '200001.tar')
         #print(model_fp32)
-        
+        '''
         torch.save({
             'global_step': 199999,
             'network_fn_state_dict': model.state_dict(),
@@ -1438,12 +1551,8 @@ def train():
         }, path)
         print('Saved checkpoints at', path)
         '''
-    '''
-    model_fp32.qconfig = torch.quantization.get_default_qconfig('fbgemm')
-    for name, module in model_fp32.named_modules():
-        print(type(module))
-    model_int8 = torch.ao.quantization.quantize_dynamic(model_fp32, {torch.nn.Linear},dtype=torch.qint8)
-    print(model_int8)'''
+        
+       
 
     
 
