@@ -6,8 +6,12 @@ cd nerf-pytorch
 pip install -r requirements.txt
 ```
 
+Download data for two example datasets: `lego` and `fern`
+```
+bash download_example_data.sh
+```
 
-Download the data [here](https://drive.google.com/drive/folders/128yBriW1IG_3NJ5Rp7APSTZsJqdJdfc1). Place the downloaded dataset according to the following directory structure:
+Download more data [here](https://drive.google.com/drive/folders/128yBriW1IG_3NJ5Rp7APSTZsJqdJdfc1). Place the downloaded dataset according to the following directory structure:
 ```
 ├── configs                                                                                                       
 │   ├── ...                                                                                     
