@@ -1,3 +1,5 @@
+This research work is based on the code from https://github.com/yenchenlin/nerf-pytorch and the [Paper](https://arxiv.org/abs/2003.08934)
+
 Installation
 
 ```
