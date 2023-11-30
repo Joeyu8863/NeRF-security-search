@@ -156,7 +156,7 @@ def get_embedder_cpu(multires, i=0):
 class quan_NeRF(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
         super(quan_NeRF, self).__init__()
-        #self.quant = torch.quantization.QuantStub()
+        self.quant = torch.quantization.QuantStub()
         self.D = D
         self.W = W
         self.input_ch = input_ch
@@ -191,7 +191,7 @@ class quan_NeRF(nn.Module):
             self.rgb_linear = quan_Linear(W//2, 3)
         else:
             self.output_linear = quan_Linear(W, output_ch)
-        #self.dequant = torch.quantization.DeQuantStub()
+        self.dequant = torch.quantization.DeQuantStub()
 
     def forward(self, x):
         
@@ -262,7 +262,7 @@ class NeRF(nn.Module):
         """ 
         """
         super(NeRF, self).__init__()
-        #self.quant = torch.quantization.QuantStub()
+        self.quant = torch.quantization.QuantStub()
         self.D = D
         self.W = W
         self.input_ch = input_ch
@@ -308,6 +308,7 @@ class NeRF(nn.Module):
         self.pts_linears_6 = bilinear(256,256)
         self.pts_linears_7 = bilinear(256,256)
         
+        self.relu = F.relu
         
         
         ### Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
@@ -323,6 +324,7 @@ class NeRF(nn.Module):
             self.rgb_linear = bilinear(W//2, 3)
         else:
             self.output_linear = bilinear(W, output_ch)
+        self.dequant = torch.quantization.DeQuantStub()
     def forward(self, x):
         #x = self.quant(x)
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
@@ -336,22 +338,22 @@ class NeRF(nn.Module):
                 
         '''
         h = self.pts_linears_0(h)
-        h = F.relu(h)
+        h = self.relu(h)
         h = self.pts_linears_1(h)
-        h = F.relu(h)
+        h = self.relu(h)
         h = self.pts_linears_2(h)
-        h = F.relu(h)
+        h = self.relu(h)
         h = self.pts_linears_3(h)
-        h = F.relu(h)
+        h = self.relu(h)
         h = self.pts_linears_4(h)
-        h = F.relu(h)
+        h = self.relu(h)
         h = torch.cat([input_pts, h], -1)
         h = self.pts_linears_5(h)
-        h = F.relu(h)
+        h = self.relu(h)
         h = self.pts_linears_6(h)
-        h = F.relu(h)
+        h = self.relu(h)
         h = self.pts_linears_7(h)
-        h = F.relu(h)
+        h = self.relu(h)
         
         if self.use_viewdirs:
             alpha = self.alpha_linear(h)
@@ -359,7 +361,7 @@ class NeRF(nn.Module):
             h = torch.cat([feature, input_views], -1)
             
             h = self.views_linears(h)
-            h = F.relu(h)
+            h = self.relu(h)
             '''
             for i, l in enumerate(self.views_linears):
                 h = self.views_linears[i](h)
